@@ -16,12 +16,6 @@ def _parse_json_list(v):
     return v
 
 
-class ModelTier(str, Enum):
-    HAIKU = "claude-haiku-4-5"
-    SONNET = "claude-sonnet-4-6"
-    OPUS = "claude-opus-4-7"
-
-
 class SearchSource(str, Enum):
     TAVILY = "tavily"
     FIRECRAWL = "firecrawl"

@@ -21,6 +21,11 @@ For each sub-question, specify:
   page content, both for comprehensive coverage)
 - Priority (1=highest, 5=lowest)
 
+Set estimated_rounds:
+- 1 if the question can be fully answered with a single round of search
+- 2 if the question is broad, requires recent data, or likely has information gaps
+  that a second targeted search round should fill
+
 Think about: What angles are missing? What needs recent data? What needs academic
 sources vs. news vs. technical docs?
 

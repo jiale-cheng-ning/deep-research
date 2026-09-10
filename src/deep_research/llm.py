@@ -1,11 +1,23 @@
 import anthropic
+import asyncio
 import json
 import logging
+import random
 from dataclasses import dataclass, field
 
 from .config import Settings
 
 logger = logging.getLogger("deep_research.llm")
+
+_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+
+class _RetryableAPIError(Exception):
+    """Wrap API errors that should be retried."""
+
+    def __init__(self, status_code: int, message: str):
+        self.status_code = status_code
+        super().__init__(message)
 
 
 @dataclass
@@ -52,7 +64,7 @@ class BudgetExhaustedError(Exception):
 
 
 class LLMClient:
-    """Async Anthropic client with agentic tool-calling loop and budget tracking."""
+    """Async Anthropic client with agentic tool-calling loop, retries, and budget tracking."""
 
     def __init__(self, settings: Settings, budget: TokenBudget):
         self.client = anthropic.AsyncAnthropic(
@@ -63,6 +75,35 @@ class LLMClient:
             },
         )
         self.budget = budget
+        self.max_retries = settings.llm_max_retries
+        self.retry_base_delay = settings.llm_retry_base_delay
+
+    async def _create_with_retry(self, **kwargs):
+        """Call messages.create with exponential backoff on retryable errors."""
+        last_exc: Exception | None = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                return await self.client.messages.create(**kwargs)
+            except anthropic.APIStatusError as e:
+                status = getattr(e, "status_code", None) or 0
+                if status not in _RETRYABLE_STATUS or attempt >= self.max_retries:
+                    raise
+                last_exc = e
+            except (anthropic.APIConnectionError, anthropic.APITimeoutError) as e:
+                if attempt >= self.max_retries:
+                    raise
+                last_exc = e
+            except Exception as e:
+                # Unknown error — do not retry
+                raise
+
+            delay = self.retry_base_delay * (2 ** attempt) + random.uniform(0, 0.5)
+            logger.warning(
+                "LLM call failed (attempt %d/%d): %s — retrying in %.1fs",
+                attempt + 1, self.max_retries + 1, last_exc, delay,
+            )
+            await asyncio.sleep(delay)
+        raise last_exc  # pragma: no cover
 
     async def run_agent(
         self,
@@ -82,13 +123,16 @@ class LLMClient:
         total_usage = TokenUsage()
         local_messages = list(messages)
 
-        # When force_tool is True and tools are provided, force the model to call submit_result
-        tool_choice = {"type": "any"} if force_tool and tools else anthropic.NOT_GIVEN
+        # Pin tool_choice to the exact structured-output tool name
+        if force_tool and tools:
+            tool_choice = {"type": "tool", "name": tools[0]["name"]}
+        else:
+            tool_choice = anthropic.NOT_GIVEN
 
         for turn in range(10):
             self.budget.check()
 
-            response = await self.client.messages.create(
+            response = await self._create_with_retry(
                 model=model,
                 max_tokens=max_output_tokens,
                 system=system,

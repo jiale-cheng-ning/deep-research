@@ -1,11 +1,31 @@
 import json
 import logging
+import re
 from abc import ABC, abstractmethod
 
 from ..config import Settings
 from ..llm import LLMClient, TokenUsage
 
 logger = logging.getLogger("deep_research.agents")
+
+_LITERAL_ESCAPES = re.compile(r"\\([nrt\\])")
+
+
+def _unescape_literal_escapes(text: str) -> str:
+    """Turn literal \\n / \\r / \\t / \\\\ sequences into real characters."""
+    mapping = {"n": "\n", "r": "\r", "t": "\t", "\\": "\\"}
+    return _LITERAL_ESCAPES.sub(lambda m: mapping[m.group(1)], text)
+
+
+def _normalize_strings(data):
+    """Recursively un-escape literal newlines/tabs in every string value."""
+    if isinstance(data, str):
+        return _unescape_literal_escapes(data)
+    if isinstance(data, dict):
+        return {k: _normalize_strings(v) for k, v in data.items()}
+    if isinstance(data, list):
+        return [_normalize_strings(item) for item in data]
+    return data
 
 
 def _coerce_stringified_json(data: dict) -> dict:
@@ -31,7 +51,7 @@ def _coerce_stringified_json(data: dict) -> dict:
             ]
         else:
             result[key] = value
-    return result
+    return _normalize_strings(result)
 
 
 class BaseAgent(ABC):

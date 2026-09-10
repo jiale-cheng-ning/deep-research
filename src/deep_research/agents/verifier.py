@@ -1,7 +1,12 @@
+import logging
+
 from ..config import Settings
 from ..llm import LLMClient, TokenUsage
 from ..models import VerificationOutput, AnalysisOutput
+from ..search import SearchTools
 from .base import BaseAgent
+
+logger = logging.getLogger("deep_research.agents.verifier")
 
 
 class VerifierAgent(BaseAgent):
@@ -21,6 +26,9 @@ For each claim, determine:
 - How many sources support vs contradict it
 - Notes on any issues
 
+If you are given ADDITIONAL EVIDENCE from independent verification searches,
+use it to upgrade or downgrade the claim status accordingly.
+
 Also identify:
 - contradictions: explicit disagreements between sources
 - overall_confidence: 0.0 to 1.0 across all claims
@@ -34,7 +42,62 @@ You MUST call the submit_result tool with your structured output."""
     def output_schema(self) -> dict:
         return VerificationOutput.model_json_schema()
 
-    async def execute(self, all_analyses: list[AnalysisOutput]) -> tuple[VerificationOutput, TokenUsage]:
+    async def _gather_verification_evidence(
+        self,
+        all_analyses: list[AnalysisOutput],
+        search_tools: SearchTools | None,
+        max_claims: int = 5,
+    ) -> str:
+        """Run targeted searches for low-confidence / single-source claims."""
+        if search_tools is None:
+            return ""
+
+        # Collect claims that need external verification
+        candidates = []
+        for analysis in all_analyses:
+            for claim in analysis.claims:
+                needs_check = (
+                    claim.confidence < 0.7
+                    or len(claim.source_urls) <= 1
+                    or claim.claim_type in ("statistic", "prediction")
+                )
+                if needs_check:
+                    candidates.append(claim)
+
+        # Prioritize: lowest confidence first, cap the number of searches
+        candidates.sort(key=lambda c: c.confidence)
+        to_verify = candidates[:max_claims]
+
+        if not to_verify:
+            return ""
+
+        logger.info("Verifier running %d targeted verification searches", len(to_verify))
+        evidence_parts = ["## Independent Verification Search Results\n"]
+
+        for i, claim in enumerate(to_verify, 1):
+            query = claim.text[:150]
+            try:
+                results = await search_tools.search(query, source="tavily")
+            except Exception as e:
+                logger.warning("Verification search failed for claim %d: %s", i, e)
+                continue
+
+            if not results:
+                continue
+
+            evidence_parts.append(f"\n### Verification for claim: {claim.text[:120]}\n")
+            for r in results[:3]:
+                snippet = (r.get("content") or "")[:400]
+                evidence_parts.append(f"- [{r.get('title', '')}]({r['url']})\n  {snippet}\n")
+
+        text = "".join(evidence_parts)
+        return text if len(evidence_parts) > 1 else ""
+
+    async def execute(
+        self,
+        all_analyses: list[AnalysisOutput],
+        search_tools: SearchTools | None = None,
+    ) -> tuple[VerificationOutput, TokenUsage]:
         context = "Claims to verify from multiple research angles:\n\n"
         for analysis in all_analyses:
             context += f"## Sub-question: {analysis.sub_question}\n"
@@ -50,6 +113,11 @@ You MUST call the submit_result tool with your structured output."""
             if analysis.gaps:
                 context += f"Gaps: {', '.join(analysis.gaps)}\n"
             context += "\n"
+
+        # Add independent evidence from targeted verification searches
+        evidence = await self._gather_verification_evidence(all_analyses, search_tools)
+        if evidence:
+            context += "\n" + evidence
 
         messages = [{"role": "user", "content": context}]
         tool = self._make_structured_tool()

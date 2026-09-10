@@ -1,8 +1,12 @@
+import logging
+
 from ..config import Settings
 from ..llm import LLMClient, TokenUsage
 from ..models import SearchOutput, SubQuestion
 from ..search import SearchTools
 from .base import BaseAgent
+
+logger = logging.getLogger("deep_research.agents.searcher")
 
 
 class SearcherAgent(BaseAgent):
@@ -41,11 +45,22 @@ You MUST call the submit_result tool with your structured output."""
             )
             return empty, TokenUsage()
 
+        # Deep-scrape top-N results for richer analyzer context
+        top_n = getattr(self.settings, "deep_scrape_top_n", 3) if self.settings else 3
+        if top_n > 0:
+            raw_results = await search_tools.deep_scrape_top(raw_results, top_n)
+            scraped_count = sum(1 for r in raw_results if r.get("scraped"))
+            logger.info(
+                "Deep-scraped %d/%d pages for '%s'",
+                scraped_count, top_n, sub_question.question[:60],
+            )
+
         context = f"Sub-question: {sub_question.question}\n\nSearch results:\n"
         for i, r in enumerate(raw_results):
             content_preview = r["content"][:2000] if r["content"] else r.get("title", "")
+            scraped_flag = " (full page)" if r.get("scraped") else ""
             context += (
-                f"\n--- Result {i+1} ---\n"
+                f"\n--- Result {i+1}{scraped_flag} ---\n"
                 f"Title: {r['title']}\n"
                 f"URL: {r['url']}\n"
                 f"Source: {r.get('source', 'unknown')}\n"
