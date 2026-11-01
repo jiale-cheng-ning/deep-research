@@ -102,9 +102,16 @@ python main.py "神经网络压缩技术综述" --budget 300000 --verbose
 
 # 指定 run-id（便于关联 checkpoint）
 python main.py "量子计算进展" --run-id my-run-001 --output report.md
+
+# 中断后使用同一问题、配置和 run-id，跳过已完成的阶段
+python main.py "量子计算进展" --run-id my-run-001 --output report.md
 ```
 
 ### 4. 运行测试
+
+恢复以完整阶段为单位，保留已完成阶段的 Token 用量；中断阶段会重新执行。
+更换问题或模型、搜索配置时需要使用新的 run-id。损坏的阶段及其后续阶段会重跑。
+旧版本无运行元数据的 checkpoint 会被重新生成。
 
 ```bash
 python -m pytest tests/ -v

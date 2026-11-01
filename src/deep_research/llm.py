@@ -77,13 +77,26 @@ class LLMClient:
         self.budget = budget
         self.max_retries = settings.llm_max_retries
         self.retry_base_delay = settings.llm_retry_base_delay
+        if settings.llm_concurrency < 1:
+            raise ValueError("llm_concurrency must be at least 1")
+        self.semaphore = asyncio.Semaphore(settings.llm_concurrency)
 
     async def _create_with_retry(self, **kwargs):
         """Call messages.create with exponential backoff on retryable errors."""
         last_exc: Exception | None = None
         for attempt in range(self.max_retries + 1):
             try:
-                return await self.client.messages.create(**kwargs)
+                async with self.semaphore:
+                    self.budget.check()
+                    response = await self.client.messages.create(**kwargs)
+                    # Account before releasing the slot, so queued requests see it.
+                    self.budget.record(TokenUsage(
+                        input_tokens=response.usage.input_tokens,
+                        output_tokens=response.usage.output_tokens,
+                        cache_read_tokens=getattr(response.usage, "cache_read_input_tokens", 0) or 0,
+                        cache_creation_tokens=getattr(response.usage, "cache_creation_input_tokens", 0) or 0,
+                    ))
+                    return response
             except anthropic.APIStatusError as e:
                 status = getattr(e, "status_code", None) or 0
                 if status not in _RETRYABLE_STATUS or attempt >= self.max_retries:
@@ -149,7 +162,6 @@ class LLMClient:
                 cache_creation_tokens=getattr(response.usage, "cache_creation_input_tokens", 0) or 0,
             )
             total_usage = total_usage + turn_usage
-            self.budget.record(turn_usage)
 
             # Append assistant response
             assistant_content = []
@@ -164,6 +176,13 @@ class LLMClient:
                         "input": block.input,
                     })
             local_messages.append({"role": "assistant", "content": assistant_content})
+
+            # submit_result is terminal output, rather than an action to repeat.
+            if force_tool and tools and any(
+                b.get("type") == "tool_use" and b.get("name") == tools[0]["name"]
+                for b in assistant_content
+            ):
+                break
 
             # If not a tool_use stop, we're done
             if response.stop_reason != "tool_use":

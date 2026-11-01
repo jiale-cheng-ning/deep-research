@@ -4,7 +4,10 @@ import logging
 import os
 import time
 import uuid
+from dataclasses import asdict
 from pathlib import Path
+
+from pydantic import TypeAdapter
 
 from rich.console import Console
 from rich.panel import Panel
@@ -33,7 +36,6 @@ class ResearchPipeline:
         self.llm = LLMClient(settings, self.budget)
         self.search_tools = SearchTools(settings)
         self.console = Console()
-        self.llm_semaphore = asyncio.Semaphore(settings.llm_concurrency)
 
         self.run_id = run_id or time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
         self.checkpoint_dir = Path(settings.checkpoint_dir) / self.run_id
@@ -44,6 +46,7 @@ class ResearchPipeline:
         self.analyzer = AnalyzerAgent(self.llm, settings)
         self.verifier = VerifierAgent(self.llm, settings)
         self.writer = WriterAgent(self.llm, settings)
+        self._resume_valid = True
 
     # ------------------------------------------------------------------ utils
     def _checkpoint(self, name: str, data) -> None:
@@ -51,7 +54,9 @@ class ResearchPipeline:
         path = self.checkpoint_dir / f"{name}.json"
         try:
             payload = data.model_dump() if hasattr(data, "model_dump") else data
-            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            temporary = path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(temporary, path)
             logger.debug("Checkpoint saved: %s", path)
         except Exception as e:
             logger.warning("Failed to save checkpoint %s: %s", name, e)
@@ -64,6 +69,36 @@ class ResearchPipeline:
             except Exception as e:
                 logger.warning("Failed to load checkpoint %s: %s", name, e)
         return None
+
+    async def _stage(self, name, operation, output_type):
+        adapter = TypeAdapter(output_type)
+        saved = self._load_checkpoint(name) if self._resume_valid else None
+        if saved is not None:
+            try:
+                if saved["question"] != self._question or saved["format"] != 1:
+                    raise ValueError("Checkpoint belongs to a different question or format")
+                output = adapter.validate_python(saved["data"])
+                usage = TokenUsage(**saved["usage"])
+                if any(value < 0 for value in asdict(usage).values()):
+                    raise ValueError("Invalid checkpoint usage")
+            except (KeyError, TypeError, ValueError) as exc:
+                logger.warning("Ignoring invalid checkpoint %s: %s", name, exc)
+            else:
+                self.budget.record(usage)
+                self.console.print(f"  [cyan]Resumed {name}[/cyan]")
+                return output, usage
+        # Rebuilding an upstream stage invalidates all downstream checkpoints.
+        self._resume_valid = False
+        before = asdict(self.budget.usage)
+        output, _ = await operation()
+        usage = TokenUsage(**{
+            key: value - before[key] for key, value in asdict(self.budget.usage).items()
+        })
+        self._checkpoint(name, {
+            "format": 1, "question": self._question,
+            "data": adapter.dump_python(output, mode="json"), "usage": asdict(usage),
+        })
+        return output, usage
 
     def _budget_ok(self, min_tokens: int = 5_000) -> bool:
         return self.budget.remaining >= min_tokens
@@ -114,42 +149,64 @@ class ResearchPipeline:
     # ------------------------------------------------------------------ pipeline
     async def run(self, question: str) -> FinalReport:
         self._validate_settings()
+        self.budget.usage = TokenUsage()
+        self._resume_valid = True
+        self._question = question
+        # Never combine cached stages from different research questions/settings.
+        identity = {"question": question, "settings": self.settings.model_dump(
+            exclude={"anthropic_api_key", "tavily_api_key", "firecrawl_api_key",
+                     "max_total_tokens", "verbose", "checkpoint_dir"}
+        )}
+        previous = self._load_checkpoint("00_run")
+        if previous is not None and previous != identity:
+            raise ValueError("Run ID belongs to a different question or settings; use a new --run-id")
+        if previous is None:
+            self._resume_valid = False
+            self._checkpoint("00_run", identity)
         usage = TokenUsage()
 
         # ---- Stage 1: Plan
         self.console.print(Panel("[bold cyan]Stage 1: Planning Research Strategy[/bold cyan]"))
-        plan, plan_usage = await self.orchestrator.execute(question)
+        plan, plan_usage = await self._stage(
+            "01_plan", lambda: self.orchestrator.execute(question), ResearchPlan
+        )
         usage = usage + plan_usage
         self._show_plan(plan)
         self._show_usage("Orchestrator", plan_usage)
-        self._checkpoint("01_plan", plan)
 
         # ---- Stage 2: Parallel Search
         self.console.print(Panel("[bold yellow]Stage 2: Searching (parallel)[/bold yellow]"))
-        search_outputs, search_usage = await self._run_searches(plan)
+        search_outputs, search_usage = await self._stage(
+            "02_search", lambda: self._run_searches(plan), list[SearchOutput]
+        )
         usage = usage + search_usage
         self._show_usage("Searchers", search_usage)
-        self._checkpoint("02_search", [so.model_dump() for so in search_outputs])
 
         # ---- Stage 3: Parallel Analysis
         self.console.print(Panel("[bold green]Stage 3: Analyzing Claims (parallel)[/bold green]"))
-        analysis_outputs, analysis_usage = await self._run_analyses(search_outputs)
+        analysis_outputs, analysis_usage = await self._stage(
+            "03_analysis", lambda: self._run_analyses(search_outputs), list[AnalysisOutput]
+        )
         usage = usage + analysis_usage
         self._show_usage("Analyzers", analysis_usage)
-        self._checkpoint("03_analysis", [ao.model_dump() for ao in analysis_outputs])
 
         # ---- Stage 3.5: Second-round research for identified gaps (optional)
         if self._budget_ok(min_tokens=20_000) and plan.estimated_rounds > 1:
-            analysis_outputs, extra_usage = await self._run_gap_fill(analysis_outputs, search_outputs)
+            analysis_outputs, extra_usage = await self._stage(
+                "03b_gapfill", lambda: self._run_gap_fill(analysis_outputs, search_outputs),
+                list[AnalysisOutput],
+            )
             usage = usage + extra_usage
-            self._checkpoint("03b_gapfill", [ao.model_dump() for ao in analysis_outputs])
+        elif self._load_checkpoint("03b_gapfill") is not None:
+            self._resume_valid = False
 
         # ---- Stage 4: Verification (with real targeted searches)
         self.console.print(Panel("[bold magenta]Stage 4: Cross-Verifying Claims[/bold magenta]"))
-        verification, verify_usage = await self._run_verification(analysis_outputs)
+        verification, verify_usage = await self._stage(
+            "04_verification", lambda: self._run_verification(analysis_outputs), VerificationOutput
+        )
         usage = usage + verify_usage
         self._show_usage("Verifier", verify_usage)
-        self._checkpoint("04_verification", verification)
 
         # ---- Stage 5: Write Report
         self.console.print(Panel("[bold red]Stage 5: Synthesizing Report (Opus)[/bold red]"))
@@ -158,8 +215,10 @@ class ResearchPipeline:
                 "[yellow]Budget nearly exhausted — report quality may be reduced.[/yellow]"
             )
         try:
-            report, write_usage = await self.writer.execute(
-                question, verification, analysis_outputs, search_outputs
+            report, write_usage = await self._stage(
+                "05_report",
+                lambda: self.writer.execute(question, verification, analysis_outputs, search_outputs),
+                FinalReport,
             )
         except BudgetExhaustedError:
             self.console.print("[red]Budget exhausted during writing. Building minimal report.[/red]")
@@ -170,7 +229,6 @@ class ResearchPipeline:
             raise
         usage = usage + write_usage
         self._show_usage("Writer", write_usage)
-        self._checkpoint("05_report", report)
 
         self._show_budget_summary(usage)
         return report
