@@ -79,7 +79,7 @@ class SearchTools:
         async with self.semaphore:
             resp = await self._request_with_retry(
                 "POST",
-                "https://api.firecrawl.dev/v1/search",
+                "https://api.firecrawl.dev/v2/search",
                 headers={"Authorization": f"Bearer {self.firecrawl_key}"},
                 json={
                     "query": query,
@@ -97,7 +97,7 @@ class SearchTools:
                     "score": 0.5,
                     "source": "firecrawl",
                 }
-                for r in data.get("data", [])
+                for r in data.get("data", {}).get("web", [])
             ]
 
     async def scrape_url(self, url: str) -> str:
@@ -108,7 +108,7 @@ class SearchTools:
             async with self.semaphore:
                 resp = await self._request_with_retry(
                     "POST",
-                    "https://api.firecrawl.dev/v1/scrape",
+                    "https://api.firecrawl.dev/v2/scrape",
                     headers={"Authorization": f"Bearer {self.firecrawl_key}"},
                     json={"url": url, "formats": ["markdown"]},
                     timeout=60,
